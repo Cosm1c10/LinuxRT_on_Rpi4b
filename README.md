@@ -1,4 +1,4 @@
-# Industrial Monitoring System (IMS) - Sentinel-RT
+# Industrial Equipment Health Monitoring System (IEHMS) - Sentinel-RT
 
 ## Project Overview
 
@@ -351,5 +351,5 @@ Replace `<user_name>` with your actual QNX username.
 **Author:** Hemanth Kumar  
 **GitHub:** [@Hemanthkumar04](https://github.com/Hemanthkumar04)  
 **Email:** hky21.github@gmail.com  
-**Project Type:** Final Year Project - Industrial Monitoring System  
+**Project Type:** Final Year Project - Industrial Equipment Health Monitoring System (IEHMS) 
 **License:** Academic / Open Source
