@@ -1,75 +1,56 @@
 # ============================================================================
 # IMS Project Makefile
+#
+# RTOS: Zephyr (target: rpi_4b)
+#
+# The server binary is now built by Zephyr's west tool, NOT by this Makefile.
+# This Makefile only builds the Linux-side tools:
+#   - ims_client   (terminal client that connects to the Zephyr server)
+#
+# ============================================================================
+# Zephyr server build commands:
+#   west build -b rpi_4b .          # build
+#   west build -b rpi_4b . -t menuconfig  # configure
+#
+# SD card deployment (after build):
+#   1. Copy build/zephyr/zephyr.bin to FAT32 SD card root
+#   2. Ensure config.txt contains:
+#        kernel=zephyr.bin
+#        arm_64bit=1
+#        enable_uart=1
+#        uart_2ndstage=1
 # ============================================================================
 
-# Compiler Settings
-CC_QNX = qcc
 CC_LINUX = gcc
 
-# Include Paths
-INCLUDES = -I./apps \
-           -I./common \
-           -I./drivers \
-           -I./protocol
+INCLUDES     = -I./apps -I./common -I./drivers -I./protocol
+CFLAGS_LINUX = -D_GNU_SOURCE -Wall -Wextra $(INCLUDES)
+LIBS_LINUX   = -lssl -lcrypto -lpthread
 
-# Flags
-CFLAGS_COMMON = -Wall -Wextra $(INCLUDES)
-CFLAGS_QNX    = -V gcc_ntoaarch64le -D_QNX_SOURCE
-CFLAGS_LINUX  = -D_GNU_SOURCE
-
-# Libraries
-# FIX: QNX provides pthreads natively in libc (no -lpthread needed).
-# Linux requires the explicit -lpthread link.
-LIBS_COMMON = -lssl -lcrypto
-LIBS_QNX    = $(LIBS_COMMON) -lsocket
-LIBS_LINUX  = $(LIBS_COMMON) -lpthread
-
-# Source Files
-SRC_SERVER_DEPS = common/authorization.c \
-                  drivers/sensors.c \
-                  drivers/sensor_manager.c \
-                  protocol/protocol.c
-
-SRC_SERVER = apps/server.c
 SRC_CLIENT = apps/client.c
-SRC_TEST   = tests/sensor_test.c
 
-# Binaries
-TARGET_SERVER = ims_server
 TARGET_CLIENT = ims_client
-TARGET_TEST   = sensor_test
 
 # ============================================================================
 # Build Targets
 # ============================================================================
 
-all: server_qnx client_linux sensor_test_qnx
+all: client_linux
 
-# 1. QNX Server
-server_qnx:
-	@echo "[INFO] Building QNX Server..."
-	$(CC_QNX) $(CFLAGS_QNX) $(CFLAGS_COMMON) -o $(TARGET_SERVER) \
-		$(SRC_SERVER) $(SRC_SERVER_DEPS) $(LIBS_QNX)
-
-# 2. Linux Client
+# Linux terminal client (connects to Zephyr server over mTLS)
 client_linux:
 	@echo "[INFO] Building Linux Client..."
-	$(CC_LINUX) $(CFLAGS_LINUX) $(CFLAGS_COMMON) -o $(TARGET_CLIENT) \
-		$(SRC_CLIENT) $(LIBS_LINUX)
+	$(CC_LINUX) $(CFLAGS_LINUX) -o $(TARGET_CLIENT) $(SRC_CLIENT) $(LIBS_LINUX)
+	@echo "[OK] $(TARGET_CLIENT) built."
 
-# 3. QNX Sensor Test
-sensor_test_qnx:
-	@echo "[INFO] Building QNX Sensor Test..."
-	$(CC_QNX) $(CFLAGS_QNX) $(CFLAGS_COMMON) -o $(TARGET_TEST) \
-		$(SRC_TEST) drivers/sensors.c drivers/sensor_manager.c $(LIBS_QNX)
-
-# FIX: Removed 'rm -rf certs/' to prevent quick_start.sh from deleting 
-# newly generated keys during the build phase.
 clean:
-	@echo "[INFO] Cleaning up binaries and logs..."
-	rm -f $(TARGET_SERVER) $(TARGET_CLIENT) $(TARGET_TEST) *.o 
-	rm -f blackbox.log
+	@echo "[INFO] Cleaning up..."
+	rm -f $(TARGET_CLIENT) *.o
+	@echo "[INFO] To clean Zephyr build artefacts run:  rm -rf build/"
 
-deploy: server_qnx sensor_test_qnx
-	@echo "[INFO] Deploying to QNX..."
-	scp $(TARGET_SERVER) $(TARGET_TEST) qnxuser@10.42.0.171:/home/qnxuser/ims/
+# Generate certs then convert to C headers for Zephyr embedding
+certs:
+	@./scripts/quick_start.sh
+	@./scripts/gen_cert_headers.sh
+
+.PHONY: all client_linux clean certs
