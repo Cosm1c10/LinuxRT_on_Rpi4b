@@ -1,25 +1,26 @@
 #!/bin/bash
 # ============================================================================
-# IMS Quick Start Script  —  Zephyr / Raspberry Pi 4 Edition
+# IMS Quick Start Script  —  Linux-RT (PREEMPT_RT) / Raspberry Pi 4
 # ============================================================================
 #
 # Usage:
-#   ./scripts/quick_start.sh              # generate certs + build client
-#   ./scripts/quick_start.sh all          # also generate cert headers + west build
+#   ./scripts/quick_start.sh              # generate certs + build server & client
 #   ./scripts/quick_start.sh certs        # cert generation only
-#   ./scripts/quick_start.sh headers      # PEM -> C header conversion only
+#   ./scripts/quick_start.sh build        # build only (certs must exist)
+#   ./scripts/quick_start.sh deploy <IP>  # scp server binary to RPi 4
+#   ./scripts/quick_start.sh rt-check     # verify PREEMPT_RT on connected RPi
 #
-# Prerequisites (host machine):
-#   - openssl
-#   - gcc + libssl-dev          (for the Linux terminal client)
-#   - Zephyr SDK + west         (for the RPi 4 server image)
+# Prerequisites (RPi 4 or build host):
+#   sudo apt install gcc libssl-dev openssl
 #
+# Prerequisites (cross-compile from x86-64):
+#   sudo apt install gcc-aarch64-linux-gnu libssl-dev
+#   CC=aarch64-linux-gnu-gcc make
 # ============================================================================
 
 set -e
 cd "$(dirname "$0")/.."
 
-# Configuration
 OPENSSL_CMD="${OPENSSL_CMD:-openssl}"
 export OPENSSL_CONF="${OPENSSL_CONF:-/etc/ssl/openssl.cnf}"
 
@@ -39,10 +40,7 @@ generate_certs() {
     log "Generating TLS certificates in certs/ ..."
     mkdir -p certs
 
-    if [ ! -f "$OPENSSL_CMD" ] && ! command -v openssl &>/dev/null; then
-        error "openssl not found. Please install it."
-    fi
-    [ -f "$OPENSSL_CMD" ] || OPENSSL_CMD="openssl"
+    command -v openssl &>/dev/null || error "openssl not found. Install with: sudo apt install openssl"
 
     # CA
     if [ ! -f "certs/ca.key" ]; then
@@ -89,7 +87,6 @@ generate_certs() {
         fi
     done
 
-    # Clean intermediate files
     rm -f certs/*.csr certs/*.srl 2>/dev/null
 
     # Default client cert = admin (for quick testing)
@@ -100,61 +97,88 @@ generate_certs() {
 }
 
 # ============================================================================
-# 2. Convert PEM certs to C arrays for Zephyr embedding
+# 2. Build server and client
 # ============================================================================
-generate_cert_headers() {
-    log "Converting PEM certs to C arrays (drivers/certs/certs.h) ..."
-    if [ ! -f "certs/ca.crt" ]; then
-        error "certs/ca.crt not found. Run certificate generation first."
+build_all() {
+    log "Building ims_server and ims_client ..."
+    make all
+    log "Build complete."
+}
+
+# ============================================================================
+# 3. Deploy to RPi 4 via SCP
+# ============================================================================
+deploy() {
+    local RPI_IP="$1"
+    [ -z "$RPI_IP" ] && error "Usage: $0 deploy <RPi_IP>"
+    [ -f "ims_server" ] || error "ims_server not found. Run 'make server' first."
+
+    log "Deploying ims_server and certs to $RPI_IP ..."
+    ssh "pi@${RPI_IP}" "mkdir -p ~/ims/certs"
+    scp ims_server "pi@${RPI_IP}:~/ims/"
+    scp certs/ca.crt certs/server.crt certs/server.key \
+        "pi@${RPI_IP}:~/ims/certs/"
+
+    log "Deployed. On the RPi 4 run:"
+    echo "  ssh pi@${RPI_IP}"
+    echo "  cd ~/ims && sudo ./ims_server"
+}
+
+# ============================================================================
+# 4. Verify PREEMPT_RT on the RPi 4
+# ============================================================================
+rt_check() {
+    local RPI_IP="$1"
+    if [ -n "$RPI_IP" ]; then
+        log "Checking PREEMPT_RT on $RPI_IP ..."
+        ssh "pi@${RPI_IP}" "uname -a; cat /sys/kernel/realtime 2>/dev/null || echo 'not RT'"
+    else
+        log "Checking PREEMPT_RT on this machine ..."
+        uname -a
+        if [ -f /sys/kernel/realtime ] && [ "$(cat /sys/kernel/realtime)" = "1" ]; then
+            log "PREEMPT_RT confirmed."
+        else
+            warn "This kernel does not appear to be PREEMPT_RT patched."
+            warn "Install a real-time kernel:"
+            warn "  sudo apt install linux-image-rt-arm64   (RPi OS / Debian)"
+            warn "  sudo reboot"
+        fi
     fi
-    ./scripts/gen_cert_headers.sh
-    log "drivers/certs/certs.h updated."
 }
 
 # ============================================================================
-# 3. Build Linux terminal client
+# 5. Show Linux-RT kernel setup instructions
 # ============================================================================
-build_client() {
-    log "Building Linux terminal client (ims_client) ..."
-    make client_linux
-    log "ims_client built successfully."
-}
-
-# ============================================================================
-# 4. Build Zephyr server image (requires west + Zephyr SDK)
-# ============================================================================
-build_zephyr() {
-    log "Building Zephyr server image for rpi_4b ..."
-    if ! command -v west &>/dev/null; then
-        warn "west not found — skipping Zephyr build."
-        warn "Install Zephyr SDK and run:  west build -b rpi_4b ."
-        return
-    fi
-    west build -b rpi_4b .
-    log "Zephyr build complete.  Output: build/zephyr/zephyr.bin"
-}
-
-# ============================================================================
-# 5. SD card deployment instructions
-# ============================================================================
-show_deploy_instructions() {
+show_rt_instructions() {
     echo ""
-    echo -e "${YELLOW}=== SD Card Deployment ===${NC}"
-    echo "1. Format a micro-SD card: MBR partition table, single FAT32 partition."
-    echo "2. Download firmware files to the SD card root:"
-    echo "     https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/bcm2711-rpi-4-b.dtb"
-    echo "     https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/start4.elf"
-    echo "     https://raw.githubusercontent.com/raspberrypi/firmware/master/boot/fixup4.dat"
-    echo "3. Copy the Zephyr image:"
-    echo "     cp build/zephyr/zephyr.bin <SD_CARD_MOUNT>/"
-    echo "4. Create <SD_CARD_MOUNT>/config.txt with:"
-    echo "     kernel=zephyr.bin"
-    echo "     arm_64bit=1"
-    echo "     enable_uart=1"
-    echo "     uart_2ndstage=1"
-    echo "5. Insert card and power on.  Monitor UART (GPIO14/15, 115200 baud)."
+    echo -e "${YELLOW}=== Linux-RT Kernel Setup (Raspberry Pi 4) ===${NC}"
+    echo "Option A — Install pre-built RT kernel (easiest):"
+    echo "  sudo apt update"
+    echo "  sudo apt install linux-image-rt-arm64"
+    echo "  sudo reboot"
     echo ""
-    echo -e "${GREEN}=== Linux Client Usage ===${NC}"
+    echo "Option B — Build PREEMPT_RT kernel from source:"
+    echo "  1. Download kernel source: git clone --depth=1 https://github.com/raspberrypi/linux"
+    echo "  2. Download PREEMPT_RT patch matching your kernel version from kernel.org"
+    echo "  3. Apply patch: patch -p1 < rt-patch.patch"
+    echo "  4. Configure: make bcm2711_defconfig && make menuconfig"
+    echo "       -> General Setup -> Preemption Model -> Fully Preemptible Kernel (Real-Time)"
+    echo "  5. Build and install: make -j4 && sudo make modules_install && sudo make install"
+    echo "  6. Reboot and verify: uname -a  (should show PREEMPT_RT)"
+    echo ""
+    echo -e "${YELLOW}=== Enable I2C + 1-Wire on RPi OS ===${NC}"
+    echo "Add to /boot/config.txt:"
+    echo "  dtparam=i2c_arm=on"
+    echo "  dtoverlay=w1-gpio,gpiopin=4    # adjust to your 1-Wire GPIO pin"
+    echo ""
+    echo "Install i2c tools:"
+    echo "  sudo apt install i2c-tools"
+    echo "  sudo i2cdetect -y 1            # verify ADS1115 appears at 0x48"
+    echo ""
+    echo -e "${GREEN}=== Server Usage ===${NC}"
+    echo "  sudo ./ims_server              # root needed for SCHED_FIFO + GPIO"
+    echo ""
+    echo -e "${GREEN}=== Client Usage ===${NC}"
     echo "  ./ims_client <RPi_IP_ADDRESS>"
     echo ""
 }
@@ -166,24 +190,24 @@ case "${1:-}" in
     certs)
         generate_certs
         ;;
-    headers)
-        generate_cert_headers
+    build)
+        build_all
         ;;
-    all)
+    deploy)
         generate_certs
-        generate_cert_headers
-        build_client
-        build_zephyr
-        show_deploy_instructions
+        build_all
+        deploy "$2"
+        ;;
+    rt-check)
+        rt_check "$2"
         ;;
     "")
         generate_certs
-        generate_cert_headers
-        build_client
-        show_deploy_instructions
+        build_all
+        show_rt_instructions
         ;;
     *)
-        error "Unknown option '$1'. Use: certs | headers | all | (empty)"
+        error "Unknown option '$1'. Use: certs | build | deploy <IP> | rt-check [IP] | (empty)"
         ;;
 esac
 

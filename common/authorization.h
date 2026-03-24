@@ -2,17 +2,16 @@
 #define AUTHORIZATION_H
 
 /*
- * authorization.h
+ * authorization.h  —  Role-based client authentication via mTLS
  *
- * Platform-agnostic header.  The function signature for authorize_client()
- * differs between Zephyr (int tls_fd) and Linux/legacy (SSL *ssl) builds,
- * selected at compile time via __ZEPHYR__.
+ * Platform: Linux-RT (PREEMPT_RT) + OpenSSL
+ *
+ * authorize_client() extracts the CN and OU fields from the client's
+ * X.509 certificate (presented during mTLS handshake) and maps the
+ * OU to a UserRole.
  */
 
-/* Only include OpenSSL on non-Zephyr builds */
-#ifndef __ZEPHYR__
-    #include <openssl/ssl.h>
-#endif
+#include <openssl/ssl.h>
 
 typedef enum {
     ROLE_VIEWER = 0,
@@ -30,19 +29,12 @@ typedef struct {
 /**
  * authorize_client
  *
- * Zephyr: accepts a Zephyr TLS socket fd.  Extracts the peer certificate
- *         via getsockopt(TLS_NATIVE) -> mbedtls_ssl_get_peer_cert(), then
- *         parses CN and OU to assign a role.
- *
- * Linux:  accepts an OpenSSL SSL* handle (original behaviour).
+ * Extracts CN and OU from the peer X.509 certificate on @ssl and
+ * maps the OU string to a UserRole written into @out_id.
  *
  * Returns 0 on success, -1 if the peer certificate is missing or invalid.
  */
-#ifdef __ZEPHYR__
-    int authorize_client(int tls_fd, ClientIdentity *out_id);
-#else
-    int authorize_client(SSL *ssl, ClientIdentity *out_id);
-#endif
+int authorize_client(SSL *ssl, ClientIdentity *out_id);
 
 /**
  * role_to_string: Returns a human-readable role name.

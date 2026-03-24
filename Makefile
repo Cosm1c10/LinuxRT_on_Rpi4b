@@ -1,56 +1,68 @@
 # ============================================================================
-# IMS Project Makefile
+# IMS Project Makefile  —  Linux-RT (PREEMPT_RT) / Raspberry Pi 4
 #
-# RTOS: Zephyr (target: rpi_4b)
+# Targets:
+#   make              → build server + client
+#   make server       → build ims_server (runs on the RPi 4)
+#   make client       → build ims_client (runs on any Linux host)
+#   make certs        → generate TLS certificates
+#   make clean        → remove binaries
 #
-# The server binary is now built by Zephyr's west tool, NOT by this Makefile.
-# This Makefile only builds the Linux-side tools:
-#   - ims_client   (terminal client that connects to the Zephyr server)
+# Prerequisites (on the RPi 4 / build host):
+#   sudo apt install gcc libssl-dev
 #
-# ============================================================================
-# Zephyr server build commands:
-#   west build -b rpi_4b .          # build
-#   west build -b rpi_4b . -t menuconfig  # configure
+# Cross-compile for RPi 4 (from x86-64 host):
+#   CC=aarch64-linux-gnu-gcc make
 #
-# SD card deployment (after build):
-#   1. Copy build/zephyr/zephyr.bin to FAT32 SD card root
-#   2. Ensure config.txt contains:
-#        kernel=zephyr.bin
-#        arm_64bit=1
-#        enable_uart=1
-#        uart_2ndstage=1
+# Running the server on the RPi 4:
+#   sudo ./ims_server      # root required for SCHED_FIFO + GPIO sysfs
+#
+# Verify PREEMPT_RT kernel:
+#   uname -a              # should show "PREEMPT_RT" in the kernel string
+#   cat /sys/kernel/realtime   # should print "1"
 # ============================================================================
 
-CC_LINUX = gcc
+CC = gcc
 
 INCLUDES     = -I./apps -I./common -I./drivers -I./protocol
-CFLAGS_LINUX = -D_GNU_SOURCE -Wall -Wextra $(INCLUDES)
-LIBS_LINUX   = -lssl -lcrypto -lpthread
+CFLAGS       = -D_GNU_SOURCE -Wall -Wextra -O2 $(INCLUDES)
+
+LIBS_SERVER  = -lssl -lcrypto -lpthread -lrt
+LIBS_CLIENT  = -lssl -lcrypto -lpthread
+
+SRC_SERVER = apps/server.c \
+             common/authorization.c \
+             drivers/sensors.c \
+             drivers/sensor_manager.c \
+             protocol/protocol.c
 
 SRC_CLIENT = apps/client.c
 
+TARGET_SERVER = ims_server
 TARGET_CLIENT = ims_client
 
 # ============================================================================
-# Build Targets
+# Build targets
 # ============================================================================
 
-all: client_linux
+all: server client
 
-# Linux terminal client (connects to Zephyr server over mTLS)
-client_linux:
-	@echo "[INFO] Building Linux Client..."
-	$(CC_LINUX) $(CFLAGS_LINUX) -o $(TARGET_CLIENT) $(SRC_CLIENT) $(LIBS_LINUX)
-	@echo "[OK] $(TARGET_CLIENT) built."
+server:
+	@echo "[INFO] Building Linux-RT server (ims_server)..."
+	$(CC) $(CFLAGS) -o $(TARGET_SERVER) $(SRC_SERVER) $(LIBS_SERVER)
+	@echo "[OK]  $(TARGET_SERVER) built."
+
+client:
+	@echo "[INFO] Building Linux client (ims_client)..."
+	$(CC) $(CFLAGS) -o $(TARGET_CLIENT) $(SRC_CLIENT) $(LIBS_CLIENT)
+	@echo "[OK]  $(TARGET_CLIENT) built."
+
+certs:
+	@./scripts/quick_start.sh certs
 
 clean:
 	@echo "[INFO] Cleaning up..."
-	rm -f $(TARGET_CLIENT) *.o
-	@echo "[INFO] To clean Zephyr build artefacts run:  rm -rf build/"
+	rm -f $(TARGET_SERVER) $(TARGET_CLIENT) *.o blackbox.log
+	@echo "[DONE]"
 
-# Generate certs then convert to C headers for Zephyr embedding
-certs:
-	@./scripts/quick_start.sh
-	@./scripts/gen_cert_headers.sh
-
-.PHONY: all client_linux clean certs
+.PHONY: all server client certs clean

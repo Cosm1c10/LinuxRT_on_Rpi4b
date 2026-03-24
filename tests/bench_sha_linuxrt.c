@@ -1,6 +1,6 @@
 /*
- * bench_sha_zephyr.c  —  SHA-256 RT Benchmark  (Zephyr RTOS target)
- * =================================================================
+ * bench_sha_linuxrt.c  —  SHA-256 RT Benchmark  (Linux-RT / PREEMPT_RT)
+ * =======================================================================
  * Reference: M. Nicolella, S. Roozkhosh, D. Hoornaert, A. Bastoni,
  *            R. Mancuso — "RT-bench: An extensible benchmark framework
  *            for the analysis and management of real-time applications"
@@ -8,26 +8,34 @@
  *
  * Measures: Per-iteration SHA-256 execution time and jitter.
  *           Each iteration hashes a 64 KB buffer once.
+ *           The timed loop runs under SCHED_FIFO to minimise OS jitter.
  *
- * Build (west, target rpi_4b):
- *   Add this file to CMakeLists.txt sources and run:
- *   west build -b rpi_4b .
+ * Build (on RPi 4 with PREEMPT_RT kernel):
+ *   gcc -O2 -o bench_sha_linuxrt tests/bench_sha_linuxrt.c
  *
- * Or build standalone with Zephyr SDK cross-compiler:
- *   aarch64-zephyr-elf-gcc -I$ZEPHYR_BASE/include -O2 \
- *       -o bench_sha_zephyr tests/bench_sha_zephyr.c
+ * Run (root required for SCHED_FIFO):
+ *   sudo ./bench_sha_linuxrt
+ *
+ * Verify RT kernel first:
+ *   uname -a | grep -i "preempt_rt"
+ *   cat /sys/kernel/realtime   # should print 1
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark parameters                                               */
 /* ------------------------------------------------------------------ */
-#define ITERATIONS   1000          /* number of timed hash runs        */
-#define DATA_SIZE    (64 * 1024)   /* 64 KB input buffer per iteration */
+#define ITERATIONS   1000
+#define DATA_SIZE    (64 * 1024)
+#define RT_PRIORITY  80          /* SCHED_FIFO priority (1-99)        */
 
 /* ------------------------------------------------------------------ */
 /*  SHA-256 implementation (FIPS 180-4)                                */
@@ -111,72 +119,79 @@ static void sha256_final(SHA256_CTX *ctx, uint8_t *hash) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Timing helper  (Zephyr hardware cycle counter)                     */
+/*  Timing: CLOCK_MONOTONIC_RAW avoids NTP adjustments                */
 /* ------------------------------------------------------------------ */
 static inline uint64_t now_ns(void) {
-    return k_cyc_to_ns_near64(k_cycle_get_64());
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Static buffers (Zephyr has no malloc by default)                   */
-/* ------------------------------------------------------------------ */
-static uint8_t  s_input[DATA_SIZE];
-static uint64_t s_exec_ns[ITERATIONS];
-
-/* ------------------------------------------------------------------ */
-/*  Main                                                                */
+/*  Main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void) {
-    printk("=== RT-Bench: SHA-256  [Zephyr] ===\n");
-    printk("Iterations : %d\n", ITERATIONS);
-    printk("Input size : %d bytes per iteration\n\n", DATA_SIZE);
+    /* Lock memory to prevent page-fault jitter */
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
-    /* Prepare fixed input buffer */
-    for (int i = 0; i < DATA_SIZE; i++) s_input[i] = (uint8_t)(i & 0xFF);
+    /* Elevate to real-time scheduler */
+    struct sched_param sp = { .sched_priority = RT_PRIORITY };
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+        fprintf(stderr, "[WARN] SCHED_FIFO failed — run as root for RT scheduling\n");
 
-    uint8_t hash[32];
+    printf("=== RT-Bench: SHA-256  [Linux-RT] ===\n");
+    printf("Iterations : %d\n", ITERATIONS);
+    printf("Input size : %d bytes per iteration\n\n", DATA_SIZE);
 
-    /* Warm-up (not timed) */
+    uint8_t *input = (uint8_t *)malloc(DATA_SIZE);
+    if (!input) { fprintf(stderr, "malloc failed\n"); return 1; }
+    for (int i = 0; i < DATA_SIZE; i++) input[i] = (uint8_t)(i & 0xFF);
+
+    uint8_t  hash[32];
+    uint64_t *exec_ns = (uint64_t *)malloc(ITERATIONS * sizeof(uint64_t));
+    if (!exec_ns) { free(input); return 1; }
+
+    /* Warm-up */
     SHA256_CTX ctx;
     for (int i = 0; i < 5; i++) {
         sha256_init(&ctx);
-        sha256_update(&ctx, s_input, DATA_SIZE);
+        sha256_update(&ctx, input, DATA_SIZE);
         sha256_final(&ctx, hash);
     }
 
     /* Timed loop */
     for (int i = 0; i < ITERATIONS; i++) {
         uint64_t t0 = now_ns();
-
         sha256_init(&ctx);
-        sha256_update(&ctx, s_input, DATA_SIZE);
+        sha256_update(&ctx, input, DATA_SIZE);
         sha256_final(&ctx, hash);
-
-        s_exec_ns[i] = now_ns() - t0;
+        exec_ns[i] = now_ns() - t0;
     }
 
     /* Statistics */
     uint64_t sum = 0, min_ns = UINT64_MAX, max_ns = 0;
     for (int i = 0; i < ITERATIONS; i++) {
-        sum += s_exec_ns[i];
-        if (s_exec_ns[i] < min_ns) min_ns = s_exec_ns[i];
-        if (s_exec_ns[i] > max_ns) max_ns = s_exec_ns[i];
+        sum += exec_ns[i];
+        if (exec_ns[i] < min_ns) min_ns = exec_ns[i];
+        if (exec_ns[i] > max_ns) max_ns = exec_ns[i];
     }
     uint64_t avg_ns = sum / ITERATIONS;
     uint64_t jitter = max_ns - min_ns;
 
-    printk("SHA-256 hash (sample): ");
-    for (int i = 0; i < 8; i++) printk("%02x", hash[i]);
-    printk("...\n\n");
+    printf("SHA-256 hash (sample): ");
+    for (int i = 0; i < 8; i++) printf("%02x", hash[i]);
+    printf("...\n\n");
 
-    printk("%-24s %10s %10s %10s %10s\n",
+    printf("%-26s %10s %10s %10s %10s\n",
            "Benchmark","Min(us)","Max(us)","Avg(us)","Jitter(us)");
-    printk("%-24s %10llu %10llu %10llu %10llu\n",
-           "SHA-256 [Zephyr]",
+    printf("%-26s %10llu %10llu %10llu %10llu\n",
+           "SHA-256 [Linux-RT]",
            (unsigned long long)(min_ns/1000),
            (unsigned long long)(max_ns/1000),
            (unsigned long long)(avg_ns/1000),
            (unsigned long long)(jitter/1000));
 
+    free(input);
+    free(exec_ns);
     return 0;
 }

@@ -1,29 +1,35 @@
 /*
- * bench_md5_zephyr.c  —  MD5 RT Benchmark  (Zephyr RTOS target)
- * ==============================================================
+ * bench_md5_linuxrt.c  —  MD5 RT Benchmark  (Linux-RT / PREEMPT_RT)
+ * ===================================================================
  * Reference: M. Nicolella, S. Roozkhosh, D. Hoornaert, A. Bastoni,
  *            R. Mancuso — "RT-bench: An extensible benchmark framework
  *            for the analysis and management of real-time applications"
  *            RTNS 2022.  gitlab.com/rt-bench/rt-bench
  *
- * Measures: Per-iteration MD5 execution time and jitter.
- *           Each iteration hashes a 64 KB buffer once.
+ * Measures: Per-iteration MD5 hash time and jitter over a 64 KB buffer.
+ *           Runs under SCHED_FIFO to minimise OS scheduling noise.
  *
- * Build (west, target rpi_4b):
- *   Add this file to CMakeLists.txt sources and run:
- *   west build -b rpi_4b .
+ * Build:
+ *   gcc -O2 -o bench_md5_linuxrt tests/bench_md5_linuxrt.c
+ *
+ * Run (root required for SCHED_FIFO):
+ *   sudo ./bench_md5_linuxrt
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark parameters                                               */
 /* ------------------------------------------------------------------ */
-#define ITERATIONS  1000
-#define DATA_SIZE   (64 * 1024)
+#define ITERATIONS   1000
+#define DATA_SIZE    (64 * 1024)
+#define RT_PRIORITY  80
 
 /* ------------------------------------------------------------------ */
 /*  MD5 implementation (RFC 1321)                                      */
@@ -48,11 +54,7 @@ static const uint8_t MD5_S[64] = {
     6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
 };
 
-typedef struct {
-    uint32_t state[4];
-    uint32_t count[2];
-    uint8_t  buf[64];
-} MD5_CTX;
+typedef struct { uint32_t state[4]; uint32_t count[2]; uint8_t buf[64]; } MD5_CTX;
 
 static void md5_transform(uint32_t state[4], const uint8_t block[64]) {
     uint32_t a=state[0],b=state[1],c=state[2],d=state[3],x[16];
@@ -80,8 +82,7 @@ static void md5_update(MD5_CTX *ctx, const uint8_t *data, size_t len) {
     ctx->count[0]+=(uint32_t)(len<<3);
     if(ctx->count[0]<(uint32_t)(len<<3)) ctx->count[1]++;
     ctx->count[1]+=(uint32_t)(len>>29);
-    uint32_t part=64-idx;
-    size_t i=0;
+    uint32_t part=64-idx; size_t i=0;
     if(len>=part){ memcpy(&ctx->buf[idx],data,part); md5_transform(ctx->state,ctx->buf); for(i=part;i+63<len;i+=64) md5_transform(ctx->state,data+i); idx=0; }
     memcpy(&ctx->buf[idx],&data[i],len-i);
 }
@@ -92,75 +93,74 @@ static void md5_final(MD5_CTX *ctx, uint8_t digest[16]) {
     for(int i=0;i<4;i++){bits[i]=(uint8_t)(ctx->count[0]>>(i*8));bits[i+4]=(uint8_t)(ctx->count[1]>>(i*8));}
     uint32_t idx=(ctx->count[0]>>3)&0x3f;
     uint32_t padlen=(idx<56)?56-idx:120-idx;
-    md5_update(ctx,pad,padlen);
-    md5_update(ctx,bits,8);
+    md5_update(ctx,pad,padlen); md5_update(ctx,bits,8);
     for(int i=0;i<4;i++) for(int j=0;j<4;j++) digest[i*4+j]=(uint8_t)(ctx->state[i]>>(j*8));
 }
 
 /* ------------------------------------------------------------------ */
-/*  Timing helper  (Zephyr hardware cycle counter)                    */
+/*  Timing                                                             */
 /* ------------------------------------------------------------------ */
 static inline uint64_t now_ns(void) {
-    return k_cyc_to_ns_near64(k_cycle_get_64());
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
-
-/* ------------------------------------------------------------------ */
-/*  Static buffers                                                     */
-/* ------------------------------------------------------------------ */
-static uint8_t  s_input[DATA_SIZE];
-static uint64_t s_exec_ns[ITERATIONS];
 
 /* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void) {
-    printk("=== RT-Bench: MD5  [Zephyr] ===\n");
-    printk("Iterations : %d\n", ITERATIONS);
-    printk("Input size : %d bytes per iteration\n\n", DATA_SIZE);
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
-    for (int i = 0; i < DATA_SIZE; i++) s_input[i] = (uint8_t)(i & 0xFF);
+    struct sched_param sp = { .sched_priority = RT_PRIORITY };
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+        fprintf(stderr, "[WARN] SCHED_FIFO failed — run as root for RT scheduling\n");
 
-    uint8_t digest[16];
+    printf("=== RT-Bench: MD5  [Linux-RT] ===\n");
+    printf("Iterations : %d\n", ITERATIONS);
+    printf("Input size : %d bytes per iteration\n\n", DATA_SIZE);
 
-    /* Warm-up */
+    uint8_t *input = (uint8_t *)malloc(DATA_SIZE);
+    if (!input) { fprintf(stderr, "malloc failed\n"); return 1; }
+    for (int i = 0; i < DATA_SIZE; i++) input[i] = (uint8_t)(i & 0xFF);
+
+    uint8_t  digest[16];
+    uint64_t *exec_ns = (uint64_t *)malloc(ITERATIONS * sizeof(uint64_t));
+    if (!exec_ns) { free(input); return 1; }
+
     MD5_CTX ctx;
     for (int i = 0; i < 5; i++) {
-        md5_init(&ctx);
-        md5_update(&ctx, s_input, DATA_SIZE);
-        md5_final(&ctx, digest);
+        md5_init(&ctx); md5_update(&ctx, input, DATA_SIZE); md5_final(&ctx, digest);
     }
 
-    /* Timed loop */
     for (int i = 0; i < ITERATIONS; i++) {
         uint64_t t0 = now_ns();
-        md5_init(&ctx);
-        md5_update(&ctx, s_input, DATA_SIZE);
-        md5_final(&ctx, digest);
-        s_exec_ns[i] = now_ns() - t0;
+        md5_init(&ctx); md5_update(&ctx, input, DATA_SIZE); md5_final(&ctx, digest);
+        exec_ns[i] = now_ns() - t0;
     }
 
-    /* Statistics */
     uint64_t sum = 0, min_ns = UINT64_MAX, max_ns = 0;
     for (int i = 0; i < ITERATIONS; i++) {
-        sum += s_exec_ns[i];
-        if (s_exec_ns[i] < min_ns) min_ns = s_exec_ns[i];
-        if (s_exec_ns[i] > max_ns) max_ns = s_exec_ns[i];
+        sum += exec_ns[i];
+        if (exec_ns[i] < min_ns) min_ns = exec_ns[i];
+        if (exec_ns[i] > max_ns) max_ns = exec_ns[i];
     }
     uint64_t avg_ns = sum / ITERATIONS;
     uint64_t jitter = max_ns - min_ns;
 
-    printk("MD5 digest (sample): ");
-    for (int i = 0; i < 16; i++) printk("%02x", digest[i]);
-    printk("\n\n");
+    printf("MD5 digest (sample): ");
+    for (int i = 0; i < 16; i++) printf("%02x", digest[i]);
+    printf("\n\n");
 
-    printk("%-24s %10s %10s %10s %10s\n",
+    printf("%-26s %10s %10s %10s %10s\n",
            "Benchmark","Min(us)","Max(us)","Avg(us)","Jitter(us)");
-    printk("%-24s %10llu %10llu %10llu %10llu\n",
-           "MD5 [Zephyr]",
+    printf("%-26s %10llu %10llu %10llu %10llu\n",
+           "MD5 [Linux-RT]",
            (unsigned long long)(min_ns/1000),
            (unsigned long long)(max_ns/1000),
            (unsigned long long)(avg_ns/1000),
            (unsigned long long)(jitter/1000));
 
+    free(input); free(exec_ns);
     return 0;
 }

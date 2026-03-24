@@ -1,48 +1,49 @@
 /*
- * bench_matrix1_zephyr.c  —  Matrix Multiplication RT Benchmark  (Zephyr RTOS target)
- * =====================================================================================
+ * bench_matrix1_linuxrt.c  —  Matrix Multiplication RT Benchmark (Linux-RT)
+ * ===========================================================================
  * Reference: M. Nicolella, S. Roozkhosh, D. Hoornaert, A. Bastoni,
  *            R. Mancuso — "RT-bench: An extensible benchmark framework
  *            for the analysis and management of real-time applications"
  *            RTNS 2022.  gitlab.com/rt-bench/rt-bench
  *
- * Measures: Per-iteration execution time and jitter for a square
- *           floating-point matrix multiply  (N x N  *  N x N).
- *           N = 128  →  ~2 million FP multiply-add operations per iter.
+ * Measures: Per-iteration 128x128 float32 matrix multiply time and jitter.
+ *           Runs under SCHED_FIFO to minimise OS scheduling noise.
  *
- * Build (west, target rpi_4b):
- *   Add this file to CMakeLists.txt sources and run:
- *   west build -b rpi_4b .
+ * Build:
+ *   gcc -O2 -lm -o bench_matrix1_linuxrt tests/bench_matrix1_linuxrt.c
  *
- * prj.conf requirements:
- *   CONFIG_FPU=y
- *   CONFIG_FPU_SHARING=y
+ * Run (root required for SCHED_FIFO):
+ *   sudo ./bench_matrix1_linuxrt
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 /* ------------------------------------------------------------------ */
 /*  Benchmark parameters                                               */
 /* ------------------------------------------------------------------ */
-#define ITERATIONS  1000   /* number of timed matrix multiply runs */
-#define MATRIX_N    128    /* matrix dimension  (N x N)             */
+#define ITERATIONS   1000
+#define MATRIX_N     128
+#define RT_PRIORITY  80
 
 /* ------------------------------------------------------------------ */
-/*  Matrix storage  (static — no heap needed)                         */
+/*  Matrix storage                                                     */
 /* ------------------------------------------------------------------ */
-static float s_A[MATRIX_N][MATRIX_N];
-static float s_B[MATRIX_N][MATRIX_N];
-static float s_C[MATRIX_N][MATRIX_N];
-
-static uint64_t s_exec_ns[ITERATIONS];
+static float A[MATRIX_N][MATRIX_N];
+static float B[MATRIX_N][MATRIX_N];
+static float C[MATRIX_N][MATRIX_N];
 
 /* ------------------------------------------------------------------ */
-/*  Timing helper  (Zephyr hardware cycle counter)                    */
+/*  Timing                                                             */
 /* ------------------------------------------------------------------ */
 static inline uint64_t now_ns(void) {
-    return k_cyc_to_ns_near64(k_cycle_get_64());
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 /* ------------------------------------------------------------------ */
@@ -53,8 +54,8 @@ static void matmul(void) {
         for (int j = 0; j < MATRIX_N; j++) {
             float s = 0.0f;
             for (int k = 0; k < MATRIX_N; k++)
-                s += s_A[i][k] * s_B[k][j];
-            s_C[i][j] = s;
+                s += A[i][k] * B[k][j];
+            C[i][j] = s;
         }
     }
 }
@@ -63,51 +64,58 @@ static void matmul(void) {
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void) {
-    printk("=== RT-Bench: MATRIX1  [Zephyr] ===\n");
-    printk("Iterations  : %d\n", ITERATIONS);
-    printk("Matrix size : %dx%d float32\n\n", MATRIX_N, MATRIX_N);
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
-    /* Initialise matrices with deterministic values */
+    struct sched_param sp = { .sched_priority = RT_PRIORITY };
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+        fprintf(stderr, "[WARN] SCHED_FIFO failed — run as root for RT scheduling\n");
+
+    printf("=== RT-Bench: MATRIX1  [Linux-RT] ===\n");
+    printf("Iterations  : %d\n", ITERATIONS);
+    printf("Matrix size : %dx%d float32\n\n", MATRIX_N, MATRIX_N);
+
     for (int i = 0; i < MATRIX_N; i++)
         for (int j = 0; j < MATRIX_N; j++) {
-            s_A[i][j] = (float)(i + j + 1) / (float)MATRIX_N;
-            s_B[i][j] = (float)(i - j + MATRIX_N) / (float)MATRIX_N;
+            A[i][j] = (float)(i + j + 1) / (float)MATRIX_N;
+            B[i][j] = (float)(i - j + MATRIX_N) / (float)MATRIX_N;
         }
 
-    /* Warm-up (not timed) */
+    uint64_t *exec_ns = (uint64_t *)malloc(ITERATIONS * sizeof(uint64_t));
+    if (!exec_ns) { fprintf(stderr, "malloc failed\n"); return 1; }
+
+    /* Warm-up */
     for (int w = 0; w < 3; w++) matmul();
 
     /* Timed loop */
     for (int i = 0; i < ITERATIONS; i++) {
         uint64_t t0 = now_ns();
         matmul();
-        s_exec_ns[i] = now_ns() - t0;
+        exec_ns[i] = now_ns() - t0;
     }
 
     /* Statistics */
     uint64_t sum = 0, min_ns = UINT64_MAX, max_ns = 0;
     for (int i = 0; i < ITERATIONS; i++) {
-        sum += s_exec_ns[i];
-        if (s_exec_ns[i] < min_ns) min_ns = s_exec_ns[i];
-        if (s_exec_ns[i] > max_ns) max_ns = s_exec_ns[i];
+        sum += exec_ns[i];
+        if (exec_ns[i] < min_ns) min_ns = exec_ns[i];
+        if (exec_ns[i] > max_ns) max_ns = exec_ns[i];
     }
     uint64_t avg_ns = sum / ITERATIONS;
     uint64_t jitter = max_ns - min_ns;
 
-    /* Checksum to prevent dead-code elimination */
     float chk = 0.0f;
-    for (int i = 0; i < MATRIX_N; i++) chk += s_C[i][i];
-    /* Print as integer*10000 since printk has no %f on all configs */
-    printk("Result checksum (diag sum x10000): %d\n\n", (int)(chk * 10000.0f));
+    for (int i = 0; i < MATRIX_N; i++) chk += C[i][i];
+    printf("Result checksum (diagonal sum): %.4f\n\n", chk);
 
-    printk("%-26s %10s %10s %10s %10s\n",
+    printf("%-28s %10s %10s %10s %10s\n",
            "Benchmark","Min(us)","Max(us)","Avg(us)","Jitter(us)");
-    printk("%-26s %10llu %10llu %10llu %10llu\n",
-           "MATRIX1 [Zephyr]",
+    printf("%-28s %10llu %10llu %10llu %10llu\n",
+           "MATRIX1 [Linux-RT]",
            (unsigned long long)(min_ns/1000),
            (unsigned long long)(max_ns/1000),
            (unsigned long long)(avg_ns/1000),
            (unsigned long long)(jitter/1000));
 
+    free(exec_ns);
     return 0;
 }
