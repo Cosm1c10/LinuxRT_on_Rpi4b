@@ -221,7 +221,7 @@ static float read_w1_therm(void) {
     DIR *d = opendir("/sys/bus/w1/devices");
     if (!d) return -999.0f;
 
-    char dev_path[128] = {0};
+    char dev_path[300] = {0};
     struct dirent *entry;
     while ((entry = readdir(d)) != NULL) {
         if (strncmp(entry->d_name, "28-", 3) == 0) {
