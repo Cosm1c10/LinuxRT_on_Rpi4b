@@ -100,19 +100,20 @@ generate_certs() {
 # 2. Build server and client
 # ============================================================================
 build_all() {
-    # Auto-detect cross-compiler for ARM (Ubuntu build host → RPi 4 target)
     CROSS_CC="aarch64-linux-gnu-gcc"
     if command -v "$CROSS_CC" &>/dev/null; then
-        log "Building ARM ims_server and ARM LinuxRT tests (compiler: $CROSS_CC) ..."
-        log "Building Linux-RT ARM server (ims_server)..."
-        make all CC="$CROSS_CC" \
+        # Cross-compile server for RPi 4 (ARM), native-compile client for this host
+        log "Cross-compiling ims_server for ARM (RPi 4) with $CROSS_CC ..."
+        make server CC="$CROSS_CC" \
             EXTRA_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
             EXTRA_LDFLAGS="-L/usr/lib/aarch64-linux-gnu"
+        log "Building ims_client natively for this host ($(uname -m)) ..."
+        make client CC=gcc EXTRA_CFLAGS="" EXTRA_LDFLAGS=""
     else
-        log "Building native ims_server and ims_client ..."
+        log "Building ims_server and ims_client natively ..."
         make all
     fi
-    log "Build complete."
+    log "Build complete. Deploy ims_server to RPi 4, run ims_client here."
 }
 
 # ============================================================================
